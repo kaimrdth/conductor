@@ -17,11 +17,15 @@ Conductor is a lightweight, command-line harness designed for **local LLM infere
   * **File System:** `read_file`, `write_file`, and `list_files`.
   * **Web Fetching:** `fetch_url` extracts relevant text from web pages, utilizing local RAG (Retrieval-Augmented Generation) chunking.
   * **PDF Extraction:** Built-in support for reading PDFs (requires `pdfplumber` or `pypdf`).
+  * **Shell Commands:** `run_command` executes a curated allowlist of shell commands (`obsidian`, `git`, `ls`, `pwd`, `echo`, `ps`, `df`, `date`, `python3`) from the workspace directory. Commands outside the allowlist are blocked outright; `python3 -c` is also blocked to prevent arbitrary code execution.
 * **Multi-Mode Operation:**
   * **Default Mode:** Conversational interaction where Conductor can immediately act and use tools.
-  * **Plan Mode (`/plan`):** A read-only phase where the agent explores the workspace, analyzes the task, and outputs a structured Markdown plan (`workspace/plan.md`) without making changes.
+  * **Plan Mode (`/plan`):** A read-only phase that follows a four-step process — **Explore** (read workspace), **Analyze** (identify changes and risks), **Plan** (write structured Markdown plan to `workspace/plan.md`), **Signal** (emit `<PLAN_READY/>` when complete). No writes are permitted during this phase.
   * **Execute Mode (`/approve`):** Reviews and executes the previously generated plan step-by-step.
 * **Persistent Memory:** Context is continuously updated and saved across sessions via a `state.md` file.
+* **Obsidian Vault Integration:** If an Obsidian vault path is stored in `state.md`, file operations and `run_command obsidian` calls are also permitted against vault files, in addition to the standard `./workspace` sandbox.
+* **First-Run Onboarding:** On the first launch, Conductor prompts for your name, Obsidian vault path, and any additional context to pre-populate `state.md`. All fields are optional.
+* **ESC Interrupt:** Press `ESC` at any time while the agent is running to cancel the current turn mid-stream. The turn is discarded and the prompt returns immediately.
 * **Qwen3 Optimized:** Intelligently handles Qwen3's thinking tokens, stripping them from the assistant history to save context space, while utilizing `/no_think` prompts for tool-execution turns.
 
 ## Prerequisites

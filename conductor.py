@@ -112,7 +112,7 @@ _LOGO_SMALL = (
     "\u259d\u2580 \u259d\u2580 \u2598 \u2598\u259d\u2580\u2598\u259d\u2580\u2598\u259d\u2580  \u2580 \u259d\u2580 \u2598  \U0001fa84"
 )
 
-_LOGO_WIDTH_THRESHOLD = 100
+_LOGO_WIDTH_THRESHOLD = 88
 
 
 def print_mode_banner(mode: str):
