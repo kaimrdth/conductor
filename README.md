@@ -1,11 +1,11 @@
-# Conductor — Local Agentic Harness for Qwen3
+# Conductor | A Local Agentic Harness for Qwen3
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Ollama](https://img.shields.io/badge/Ollama-Supported-orange.svg)](https://ollama.com/)
 [![Model: Qwen3.5:9b](https://img.shields.io/badge/Model-Qwen3.5:9b-green.svg)](https://qwenlm.github.io/)
 
-Conductor is a lightweight, command-line harness designed for **local LLM inference**. It transforms local models (specifically optimized for Qwen3 via Ollama) into capable, autonomous agents utilizing a ReAct (Reason and Act) loop.
+Conductor is a lightweight, command-line harness designed for **local LLM inference**. It transforms local models (specifically optimized for Qwen3 via Ollama) into capable, autonomous agents utilizing a ReAct (Reason and Act) loop. This was built primarily as an experiment to test the upper bound of running local inference with a harness on a decent-ish laptop.
 
 **Hardware Context:** This harness was explicitly built, constrained, and tested on a **2021 MacBook Pro (M1 chip, 16GB RAM)**. It demonstrates that sophisticated, agentic workflows—including web scraping, RAG, and file manipulation—can run securely and efficiently entirely on consumer hardware, without relying on cloud APIs.
 
