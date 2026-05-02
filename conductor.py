@@ -537,7 +537,7 @@ def _retrieve_chunks(query: str, chunks: list[str], top_k: int = 4) -> list[str]
         q_emb  = model.encode(query, convert_to_tensor=True)
         c_embs = model.encode(chunks, convert_to_tensor=True)
         scores = st_util.cos_sim(q_emb, c_embs)[0].tolist()
-    except ImportError:
+    except Exception:
         qw     = set(query.lower().split())
         scores = [len(qw & set(c.lower().split())) / max(len(qw), 1) for c in chunks]
     ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
