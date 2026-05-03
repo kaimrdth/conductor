@@ -28,6 +28,9 @@ Conductor is a lightweight, command-line harness designed for **local LLM infere
 * **Obsidian Vault Integration:** If an Obsidian vault path is stored in `state.md`, file operations and `run_command obsidian` calls are also permitted against vault files, in addition to the standard `./workspace` sandbox.
 * **First-Run Onboarding:** On the first launch, Conductor prompts for your name, Obsidian vault path, and any additional context to pre-populate `state.md`. All fields are optional.
 * **ESC Interrupt:** Press `ESC` at any time while the agent is running to cancel the current turn mid-stream. The turn is discarded and the prompt returns immediately.
+* **Voice Input (Push-to-Talk):** Hold right ⌥ (Option) to record, release to transcribe and send. Text is injected directly at the prompt. Falls back to `/mic` for manual record-then-Enter input. Requires `pynput`, `sounddevice`, and `mlx-whisper`; PTT needs a one-time macOS Accessibility permission grant.
+* **Write Approval with Diff Preview:** Before any file is written, Conductor shows a line-level diff (green highlights for additions, red for removals) and prompts `y / a (approve all) / n`. No file is touched without explicit confirmation.
+* **Visual Progress Indicators:** A grey dot appears on tool start, replaced by a green dot on completion. Chained tool calls are displayed hierarchically and collapsed after 3 with a "+N more tool uses" summary.
 * **Qwen3 Optimized:** Intelligently handles Qwen3's thinking tokens, stripping them from the assistant history to save context space, while utilizing `/no_think` prompts for tool-execution turns.
 
 ## Prerequisites
@@ -50,6 +53,11 @@ Conductor is a lightweight, command-line harness designed for **local LLM infere
    ```bash
    pip install pdfplumber pypdf sentence-transformers
    ```
+4. *(Optional)* Install voice input dependencies (push-to-talk + `/mic`):
+   ```bash
+   pip install mlx-whisper sounddevice pynput
+   ```
+   > **macOS:** PTT requires granting Accessibility permission to your terminal app — System Settings → Privacy & Security → Accessibility.
 
 ## Usage
 
@@ -67,6 +75,7 @@ Inside the Conductor interface, you can use the following commands to manage the
 * `/approve` — Execute the plan currently saved in `workspace/plan.md`.
 * `/state` — View the current persistent memory state.
 * `/compact [focus]` — Instructs the LLM to compress the current conversation history into a dense summary, freeing up the context window.
+* `/mic` — Fallback voice input: starts recording immediately, press Enter to stop and transcribe.
 * `/clear` — Clear the active conversation history (does not delete the persistent `state.md`).
 * `/help` — Display the list of commands.
 * `/exit` or `/quit` — Exit the application and display session statistics (time elapsed, tokens used, tool calls made).
