@@ -26,6 +26,7 @@ import textwrap
 import contextlib
 import select
 import threading
+import queue as _queue_module
 import sys
 from pathlib import Path
 from typing import Optional
@@ -36,6 +37,10 @@ try:
     _HAS_TERMIOS = True
 except ImportError:
     _HAS_TERMIOS = False
+
+# PTT queue — filled by _ptt_record(), drained by _prompt_input()
+_ptt_queue:  _queue_module.Queue = _queue_module.Queue()
+_ptt_active: threading.Event     = threading.Event()
 
 import httpx
 from bs4 import BeautifulSoup
@@ -143,7 +148,9 @@ def boot():
     console.print()
     console.print(f"  [dim]model    [/dim][green]{MODEL_NAME}[/green]")
     console.print(f"  [dim]workspace[/dim] [dim]{WORKSPACE}[/dim]")
-    console.print(f"  [dim]commands [/dim][dim]/exit · /state · /clear · /compact · /plan · /help[/dim]")
+    console.print(f"  [dim]commands [/dim][dim]/exit · /state · /clear · /compact · /plan · /mic · /help[/dim]")
+    ptt_status = "[green]hold right ⌥ to speak[/green]" if _ptt_enabled else "[dim]ptt unavailable — use /mic[/dim]"
+    console.print(f"  [dim]voice    [/dim]{ptt_status}")
     console.print()
     console.print(f"  [dim]{'─' * 54}[/dim]")
     console.print()
@@ -268,6 +275,240 @@ class EscListener:
         self._restore()
         if self._thread.is_alive():
             self._thread.join(timeout=0.3)
+
+# ---------------------------------------------------------------------------
+# Speech-to-text
+# ---------------------------------------------------------------------------
+
+def _ptt_record():
+    """Record while _ptt_active is set, transcribe, push result to _ptt_queue."""
+    try:
+        import sounddevice as sd
+        import numpy as np
+        import mlx_whisper
+    except ImportError as e:
+        sys.stderr.write(f"\r\033[K  STT unavailable: {e}\n")
+        sys.stderr.flush()
+        return
+
+    sample_rate = 16000
+    frames: list = []
+    chunk_size   = int(sample_rate * 0.1)
+
+    sys.stderr.write("\r  \033[31m●\033[0m \033[2m recording — release ⌥ to send\033[0m   ")
+    sys.stderr.flush()
+
+    try:
+        with sd.InputStream(samplerate=sample_rate, channels=1, dtype="float32") as stream:
+            while _ptt_active.is_set():
+                chunk, _ = stream.read(chunk_size)
+                frames.append(chunk.copy())
+    except Exception as e:
+        sys.stderr.write(f"\r\033[K  mic error: {e}\n")
+        sys.stderr.flush()
+        return
+    finally:
+        sys.stderr.write("\r\033[K")
+        sys.stderr.flush()
+
+    if not frames:
+        return
+    audio = np.concatenate(frames, axis=0).flatten()
+    if len(audio) / sample_rate < 0.2:
+        return
+
+    sys.stderr.write("  \033[2m● transcribing...\033[0m  ")
+    sys.stderr.flush()
+    try:
+        result = mlx_whisper.transcribe(
+            audio, path_or_hf_repo="mlx-community/whisper-base.en-mlx", language="en"
+        )
+        text = result["text"].strip()
+        sys.stderr.write("\r\033[K")
+        sys.stderr.flush()
+        if text:
+            _ptt_queue.put(text)
+    except Exception as e:
+        sys.stderr.write(f"\r\033[K  transcription error: {e}\n")
+        sys.stderr.flush()
+
+
+_ptt_enabled = False  # set True if pynput listener starts successfully
+
+
+def _is_ptt_key(key) -> bool:
+    """Match right-Option on macOS however pynput happens to report it."""
+    try:
+        from pynput import keyboard as _kb
+        if key in (_kb.Key.alt_r, _kb.Key.alt_gr):
+            return True
+        # Some macOS/pynput versions surface it as a KeyCode with vk=61
+        if hasattr(key, 'vk') and key.vk == 61:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _start_ptt_listener():
+    """Start a background pynput listener: hold right-⌥ to record, release to send."""
+    global _ptt_enabled
+    try:
+        from pynput import keyboard as _kb
+    except ImportError:
+        return
+
+    def on_press(key):
+        if _is_ptt_key(key) and not _ptt_active.is_set():
+            _ptt_active.set()
+            threading.Thread(target=_ptt_record, daemon=True).start()
+
+    def on_release(key):
+        if _is_ptt_key(key):
+            _ptt_active.clear()
+
+    try:
+        listener = _kb.Listener(on_press=on_press, on_release=on_release)
+        listener.daemon = True
+        listener.start()
+        _ptt_enabled = True
+    except Exception as e:
+        sys.stderr.write(f"  ptt listener error: {e}\n")
+        sys.stderr.flush()
+
+
+def _prompt_input(prompt_markup: str) -> str:
+    """
+    Cbreak-mode input loop. Polls _ptt_queue so hold-⌥ voice text can arrive
+    while the prompt is open. Falls back to console.input() without termios.
+    """
+    if not _HAS_TERMIOS:
+        return console.input(prompt_markup)
+
+    console.print(prompt_markup, end="")
+    sys.stdout.flush()
+
+    fd  = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    buf: list[str] = []
+
+    try:
+        while True:
+            # PTT injection: erase any typed buffer, print transcribed text
+            try:
+                text = _ptt_queue.get_nowait()
+                if buf:
+                    sys.stdout.write('\b \b' * len(buf))
+                sys.stdout.write(text + "\n")
+                sys.stdout.flush()
+                return text
+            except _queue_module.Empty:
+                pass
+
+            ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+            if not ready:
+                continue
+
+            raw = os.read(fd, 1)
+            if not raw:
+                raise EOFError
+            b = raw[0]
+
+            if b == 0x03:               raise KeyboardInterrupt   # Ctrl-C
+            if b == 0x04:               raise EOFError             # Ctrl-D
+            if b in (0x0A, 0x0D):       # Enter
+                sys.stdout.write('\n')
+                sys.stdout.flush()
+                return ''.join(buf)
+            if b in (0x7F, 0x08):       # Backspace
+                if buf:
+                    buf.pop()
+                    sys.stdout.write('\b \b')
+                    sys.stdout.flush()
+                continue
+            if b == 0x1B:               # Escape / ANSI seq — swallow
+                if select.select([sys.stdin], [], [], 0.02)[0]:
+                    os.read(fd, 16)
+                continue
+            if b < 0x20:                # other control chars — ignore
+                continue
+
+            # Multi-byte UTF-8
+            if   b >= 0xF0: n_extra = 3
+            elif b >= 0xE0: n_extra = 2
+            elif b >= 0xC0: n_extra = 1
+            else:           n_extra = 0
+            for _ in range(n_extra):
+                raw += os.read(fd, 1)
+            try:
+                ch = raw.decode('utf-8')
+                buf.append(ch)
+                sys.stdout.write(ch)
+                sys.stdout.flush()
+            except UnicodeDecodeError:
+                pass
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def record_and_transcribe() -> Optional[str]:
+    """/mic fallback: records until Enter is pressed, then transcribes."""
+    try:
+        import sounddevice as sd
+        import numpy as np
+        import mlx_whisper
+    except ImportError as e:
+        console.print(
+            f"[yellow]  STT not available:[/yellow] {e}\n"
+            "  Install: pip install mlx-whisper sounddevice pynput"
+        )
+        return None
+
+    sample_rate = 16000
+    frames: list = []
+    stop_event   = threading.Event()
+
+    def _record():
+        chunk_size = int(sample_rate * 0.1)
+        try:
+            with sd.InputStream(samplerate=sample_rate, channels=1, dtype="float32") as stream:
+                while not stop_event.is_set():
+                    chunk, _ = stream.read(chunk_size)
+                    frames.append(chunk.copy())
+        except Exception as e:
+            console.print(f"\n[dim]  mic error: {e}[/dim]")
+
+    rec_thread = threading.Thread(target=_record, daemon=True)
+    rec_thread.start()
+    try:
+        ctx = _esc_listener.paused() if _esc_listener else contextlib.nullcontext()
+        with ctx:
+            console.input("  [dim]● recording — press Enter to stop[/dim]  ")
+    except (EOFError, KeyboardInterrupt):
+        pass
+    stop_event.set()
+    rec_thread.join(timeout=2.0)
+
+    if not frames:
+        return None
+    audio = np.concatenate(frames, axis=0).flatten()
+    if len(audio) / sample_rate < 0.3:
+        console.print("[dim]  (nothing recorded)[/dim]")
+        return None
+
+    console.print("[dim]  ● transcribing...[/dim]", end="\r")
+    try:
+        result = mlx_whisper.transcribe(
+            audio, path_or_hf_repo="mlx-community/whisper-base.en-mlx", language="en"
+        )
+        text = result["text"].strip()
+        console.print("\r\033[K", end="")
+        return text or None
+    except Exception as e:
+        console.print(f"\r\033[K[dim]  transcription error: {e}[/dim]")
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Status dot helpers
@@ -711,6 +952,9 @@ def call_model(
     eval_tokens:   int       = 0
     interrupted:   bool      = False
 
+    # Cap thinking to prevent runaway inference
+    if "thinking_budget" not in options:
+        options["thinking_budget"] = 512
     with Throbber(label):
         stream = ollama.chat(
             model=MODEL_NAME,
@@ -966,6 +1210,7 @@ def _fmt_duration(seconds: float) -> str:
 
 def main():
     ensure_state_file()
+    _start_ptt_listener()
     boot()
 
     vault_path = read_vault_path()
@@ -997,7 +1242,7 @@ def main():
     while True:
         try:
             _ms        = MODE_STYLES[mode]
-            user_input = console.input(
+            user_input = _prompt_input(
                 f"\n[{_ms['prompt']}]{_ms['prompt_text']}[/{_ms['prompt']}] [dim]›[/dim] "
             ).strip()
 
@@ -1106,6 +1351,17 @@ def main():
                 print_mode_banner("default")
                 continue
 
+            elif user_input.lower() == "/mic":
+                transcribed = record_and_transcribe()
+                if transcribed:
+                    console.print(
+                        f"\n[dim]  ↳ heard:[/dim] [italic]{transcribed}[/italic]"
+                    )
+                    user_input = transcribed
+                    # Fall through — treat as normal input below
+                else:
+                    continue
+
             elif user_input.lower() == "/help":
                 console.print(Panel(
                     "[dim]/exit[/dim]     quit conductor\n"
@@ -1114,6 +1370,7 @@ def main():
                     "[dim]/compact[/dim]  compress conversation history (optional: focus instructions)\n"
                     "[dim]/plan[/dim]     toggle plan mode (read-only, produces workspace/plan.md)\n"
                     "[dim]/approve[/dim]  execute the current plan\n"
+                    "[dim]/mic[/dim]      record voice input (requires mlx-whisper + sounddevice)\n"
                     "[dim]/help[/dim]     show this message",
                     title="[bold]commands[/bold]",
                     border_style="dim",
