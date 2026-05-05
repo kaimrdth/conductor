@@ -28,6 +28,7 @@ import select
 import threading
 import queue as _queue_module
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -647,6 +648,86 @@ def read_vault_path() -> Optional[Path]:
             p = Path(m.group(1).strip())
             return p if p.exists() else None
     return None
+
+
+def _read_city() -> Optional[str]:
+    """Read city from context/user.md if configured."""
+    user_file = CONTEXT_DIR / "user.md"
+    if user_file.exists():
+        m = re.search(r"City:\s*(.+)", user_file.read_text())
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+_WMO_WEATHER_CODES = {
+    0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+    45: "Foggy", 48: "Depositing rime fog",
+    51: "Light drizzle", 53: "Moderate drizzle", 55: "Dense drizzle",
+    56: "Light freezing drizzle", 57: "Dense freezing drizzle",
+    61: "Slight rain", 63: "Moderate rain", 65: "Heavy rain",
+    66: "Light freezing rain", 67: "Heavy freezing rain",
+    71: "Slight snow", 73: "Moderate snow", 75: "Heavy snow",
+    77: "Snow grains",
+    80: "Slight rain showers", 81: "Moderate rain showers", 82: "Violent rain showers",
+    85: "Slight snow showers", 86: "Heavy snow showers",
+    95: "Thunderstorm", 96: "Thunderstorm with slight hail", 99: "Thunderstorm with heavy hail",
+}
+
+
+def _fetch_weather(city: str) -> Optional[str]:
+    """Fetch current weather from Open-Meteo (free, no API key). Returns None on any failure."""
+    try:
+        geo = httpx.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": city, "count": 1},
+            timeout=5,
+        )
+        geo.raise_for_status()
+        results = geo.json().get("results")
+        if not results:
+            return None
+        lat, lon = results[0]["latitude"], results[0]["longitude"]
+
+        wx = httpx.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat, "longitude": lon,
+                "current": "temperature_2m,weathercode",
+                "temperature_unit": "fahrenheit",
+            },
+            timeout=5,
+        )
+        wx.raise_for_status()
+        current = wx.json().get("current", {})
+        temp = current.get("temperature_2m")
+        code = current.get("weathercode", 0)
+        desc = _WMO_WEATHER_CODES.get(code, "Unknown")
+        return f"{desc}, {temp}°F" if temp is not None else None
+    except Exception:
+        return None
+
+
+def refresh_environment():
+    """Write context/environment.md with current date/time and optional weather."""
+    now = datetime.now()
+    lines = [
+        "# Environment\n",
+        f"- Date: {now.strftime('%A, %B %d, %Y').replace(' 0', ' ')}\n",
+        f"- Time: {now.strftime('%I:%M %p').lstrip('0')}\n",
+        f"- Timezone: {time.tzname[time.daylight]}\n",
+    ]
+    city = _read_city()
+    if city:
+        weather = _fetch_weather(city)
+        if weather:
+            lines.append(f"- Location: {city}\n")
+            lines.append(f"- Weather: {weather}\n")
+    try:
+        (CONTEXT_DIR / "environment.md").write_text("".join(lines))
+    except Exception:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Session transcript (append-only JSONL audit log)
@@ -1311,16 +1392,18 @@ def clean_path_input(raw: str) -> str:
     return path
 
 
-def write_onboarding_state(name: str, vault: str, notes: str):
+def write_onboarding_state(name: str, vault: str, notes: str, city: str = ""):
     # Write user context file
     user_lines = ["# User Context\n"]
     if name:
         user_lines.append(f"- User: {name}\n")
     if vault:
         user_lines.append(f"- Obsidian vault location: {vault}\n")
+    if city:
+        user_lines.append(f"- City: {city}\n")
     if notes:
         user_lines.append(f"- {notes}\n")
-    if not any([name, vault, notes]):
+    if not any([name, vault, notes, city]):
         user_lines.append("- Initialized cleanly.\n")
     (CONTEXT_DIR / "user.md").write_text("".join(user_lines))
 
@@ -1340,6 +1423,7 @@ def _fmt_duration(seconds: float) -> str:
 
 def main():
     ensure_state_file()
+    refresh_environment()
     _start_ptt_listener()
     boot()
 
@@ -1354,7 +1438,9 @@ def main():
         raw_vault = console.input("Obsidian vault path (drag folder into terminal or paste path): ")
         vault     = clean_path_input(raw_vault)
         notes     = console.input("Anything else Conductor should know about you: ").strip()
-        write_onboarding_state(name, vault, notes)
+        city      = console.input("Your city (for weather, optional): ").strip()
+        write_onboarding_state(name, vault, notes, city)
+        refresh_environment()
         vault_path = read_vault_path()
         console.print()
         console.print(Rule("ready", style="cyan"))

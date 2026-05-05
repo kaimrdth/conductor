@@ -24,13 +24,16 @@ Conductor is a lightweight, command-line harness designed for **local LLM infere
   * **Default Mode:** Conversational interaction where Conductor can immediately act and use tools.
   * **Plan Mode (`/plan`):** A read-only phase that follows a four-step process — **Explore** (read workspace), **Analyze** (identify changes and risks), **Plan** (write structured Markdown plan to `workspace/plan.md`), **Signal** (emit `<PLAN_READY/>` when complete). No writes are permitted during this phase.
   * **Execute Mode (`/approve`):** Reviews and executes the previously generated plan step-by-step.
-* **Persistent Memory:** Context is continuously updated and saved across sessions via a `state.md` file.
+* **Environment Awareness:** On each startup, Conductor writes `context/environment.md` with the current date, time, and timezone. If a city is configured, it fetches live weather from [Open-Meteo](https://open-meteo.com/) (free, no API key). Degrades gracefully offline — date/time always present, weather omitted silently on failure.
+* **Persistent Memory:** Context is managed through a modular `context/` directory — `user.md` (identity and preferences), `objectives.md` (session goals), and `environment.md` (date/time/weather). The `state.md` file serves as a thin index pointing to these context files. All context files are loaded into the system prompt each turn via `read_state()`.
 * **Obsidian Vault Integration:** If an Obsidian vault path is stored in `state.md`, file operations and `run_command obsidian` calls are also permitted against vault files, in addition to the standard `./workspace` sandbox.
-* **First-Run Onboarding:** On the first launch, Conductor prompts for your name, Obsidian vault path, and any additional context to pre-populate `state.md`. All fields are optional.
+* **First-Run Onboarding:** On the first launch, Conductor prompts for your name, Obsidian vault path, city (for weather), and any additional context. All fields are optional.
 * **ESC Interrupt:** Press `ESC` at any time while the agent is running to cancel the current turn mid-stream. The turn is discarded and the prompt returns immediately.
 * **Voice Input (Push-to-Talk):** Hold right ⌥ (Option) to record, release to transcribe and send. Text is injected directly at the prompt. Falls back to `/mic` for manual record-then-Enter input. Requires `pynput`, `sounddevice`, and `mlx-whisper`; PTT needs a one-time macOS Accessibility permission grant.
+* **Session Transcript:** Every turn is appended to `conductor_transcript.jsonl` as an append-only audit log (timestamp, role, content, tool call count). Never read back by the harness — purely for external analysis.
+* **Session Consolidation:** On exit (after 2+ turns), Conductor runs a final LLM pass to clean up `objectives.md` — deduplicating facts, removing stale tasks, and resolving contradictions so the next session starts with a clean slate.
 * **Write Approval with Diff Preview:** Before any file is written, Conductor shows a line-level diff (green highlights for additions, red for removals) and prompts `y / a (approve all) / n`. No file is touched without explicit confirmation.
-* **Visual Progress Indicators:** A grey dot appears on tool start, replaced by a green dot on completion. Chained tool calls are displayed hierarchically and collapsed after 3 with a "+N more tool uses" summary.
+* **Visual Progress Indicators:** A live "Thinking... (Xs)" throbber shows elapsed time during model inference. Tool calls display as a grey dot on start, replaced by green on completion. Chained calls are shown hierarchically (indented with `└`) and collapsed after 3 with a "+N more tool uses" summary.
 * **Qwen3 Optimized:** Intelligently handles Qwen3's thinking tokens, stripping them from the assistant history to save context space, while utilizing `/no_think` prompts for tool-execution turns.
 
 ## Prerequisites
@@ -74,11 +77,11 @@ Inside the Conductor interface, you can use the following commands to manage the
 * `/plan` — Toggle **Plan Mode** (read-only). Use this to let Conductor map out a solution safely.
 * `/approve` — Execute the plan currently saved in `workspace/plan.md`.
 * `/state` — View the current persistent memory state.
-* `/compact [focus]` — Instructs the LLM to compress the current conversation history into a dense summary, freeing up the context window.
+* `/compact [focus]` — Compress the conversation history into a dense summary, freeing the context window. Optionally provide a focus (e.g., `/compact keep the file paths`) to direct what gets emphasized in the summary.
 * `/mic` — Fallback voice input: starts recording immediately, press Enter to stop and transcribe.
 * `/clear` — Clear the active conversation history (does not delete the persistent `state.md`).
 * `/help` — Display the list of commands.
-* `/exit` or `/quit` — Exit the application and display session statistics (time elapsed, tokens used, tool calls made).
+* `/exit` or `/quit` — Run session consolidation (if 2+ turns), then exit and display a summary panel with elapsed time, total turns, tool calls, and tokens consumed.
 
 ## Research & Security Basis
 
