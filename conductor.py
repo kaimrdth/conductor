@@ -56,14 +56,17 @@ import ollama
 # Config
 # ---------------------------------------------------------------------------
 
-MODEL_NAME    = "qwen3.5:9b"
-STATE_FILE    = Path(__file__).parent / "state.md"
-WORKSPACE     = Path(__file__).parent / "workspace"
-MAX_STEPS     = 8
-CHUNK_WORDS   = 450
-CHUNK_OVERLAP = 50
+MODEL_NAME       = "qwen3.5:9b"
+STATE_FILE       = Path(__file__).parent / "state.md"
+CONTEXT_DIR      = Path(__file__).parent / "context"
+WORKSPACE        = Path(__file__).parent / "workspace"
+TRANSCRIPT_FILE  = Path(__file__).parent / "conductor_transcript.jsonl"
+MAX_STEPS        = 8
+CHUNK_WORDS      = 450
+CHUNK_OVERLAP    = 50
 
 WORKSPACE.mkdir(exist_ok=True)
+CONTEXT_DIR.mkdir(exist_ok=True)
 console = Console()
 
 # Module-level reference so request_write_permission can pause ESC detection
@@ -576,31 +579,110 @@ class ToolCall(BaseModel):
 def ensure_state_file():
     if not STATE_FILE.exists():
         STATE_FILE.write_text(
-            "# Conductor Memory & State\n\n"
-            "## Current Objectives\n"
-            "- Await user instructions.\n\n"
-            "## Context & Notes\n"
-            "- Initialized cleanly. No historical context yet."
+            "# Conductor Memory Index\n\n"
+            "- [User context](context/user.md) — name, vault, preferences\n"
+            "- [Objectives](context/objectives.md) — current session goals and project state\n"
+        )
+    if not (CONTEXT_DIR / "user.md").exists():
+        (CONTEXT_DIR / "user.md").write_text(
+            "# User Context\n- Initialized cleanly. No historical context yet.\n"
+        )
+    if not (CONTEXT_DIR / "objectives.md").exists():
+        (CONTEXT_DIR / "objectives.md").write_text(
+            "# Current Objectives\n- Await user instructions.\n"
         )
 
+
 def read_state() -> str:
-    return STATE_FILE.read_text()
+    """Load the index plus all context files for the system prompt."""
+    index = STATE_FILE.read_text() if STATE_FILE.exists() else ""
+    parts = [index.strip()]
+    for ctx_file in sorted(CONTEXT_DIR.glob("*.md")):
+        parts.append(f"--- {ctx_file.name} ---\n{ctx_file.read_text().strip()}")
+    return "\n\n".join(parts)
+
+
+def read_state_index() -> str:
+    """Load only the thin index (for display via /state)."""
+    return STATE_FILE.read_text() if STATE_FILE.exists() else ""
+
 
 def write_state(new_state: str):
-    STATE_FILE.write_text(new_state.strip())
+    """Write to the objectives context file (primary update target)."""
+    (CONTEXT_DIR / "objectives.md").write_text(new_state.strip())
+
 
 def extract_state_update(text: str) -> Optional[str]:
+    # Support targeted updates: <UPDATE_STATE file="user.md">...</UPDATE_STATE>
+    targeted = re.search(
+        r'<UPDATE_STATE\s+file=["\']([^"\']+)["\']>(.*?)</UPDATE_STATE>', text, re.DOTALL
+    )
+    if targeted:
+        filename = targeted.group(1)
+        content  = targeted.group(2).strip()
+        target   = CONTEXT_DIR / filename
+        if target.resolve().parent == CONTEXT_DIR.resolve():
+            target.write_text(content)
+        return None  # already written, no need for caller to write again
+
+    # Fallback: untagged update goes to objectives.md
     m = re.search(r"<UPDATE_STATE>(.*?)</UPDATE_STATE>", text, re.DOTALL)
     return m.group(1).strip() if m else None
 
+
 def read_vault_path() -> Optional[Path]:
-    """Read vault path from state.md if configured."""
-    state = read_state()
-    m = re.search(r"Obsidian vault location:\s*(.+)", state)
-    if m:
-        p = Path(m.group(1).strip())
-        return p if p.exists() else None
+    """Read vault path from context/user.md if configured."""
+    user_file = CONTEXT_DIR / "user.md"
+    if user_file.exists():
+        content = user_file.read_text()
+        m = re.search(r"Obsidian vault location:\s*(.+)", content)
+        if m:
+            p = Path(m.group(1).strip())
+            return p if p.exists() else None
+    # Fallback to state.md for migration
+    if STATE_FILE.exists():
+        state = STATE_FILE.read_text()
+        m = re.search(r"Obsidian vault location:\s*(.+)", state)
+        if m:
+            p = Path(m.group(1).strip())
+            return p if p.exists() else None
     return None
+
+# ---------------------------------------------------------------------------
+# Session transcript (append-only JSONL audit log)
+# ---------------------------------------------------------------------------
+
+def _append_transcript(role: str, content: str, tool_calls: int = 0):
+    """Append a single JSON line to the transcript file. Never read back."""
+    entry = {"ts": time.time(), "role": role, "content": content, "tool_calls": tool_calls}
+    with open(TRANSCRIPT_FILE, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+# ---------------------------------------------------------------------------
+# End-of-session memory consolidation
+# ---------------------------------------------------------------------------
+
+def run_consolidation(state: str) -> str:
+    """Single-shot LLM call to consolidate/clean the state document."""
+    system = (
+        "You are a memory consolidation agent. Your only job is to rewrite the "
+        "state document passed to you. Remove objectives that are marked done or "
+        "are clearly stale. Deduplicate any repeated facts. Resolve contradictions "
+        "by keeping the more recent or specific version. Preserve all information "
+        "that is still actionable. Return only the rewritten state document, no "
+        "commentary, no preamble."
+    )
+    response = ollama.chat(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": state},
+        ],
+        stream=False,
+        options={"temperature": 0.0},
+    )
+    result = response.message.content or ""
+    return strip_thinking(result)
 
 # ---------------------------------------------------------------------------
 # Display helpers
@@ -689,6 +771,8 @@ def _safe_path(path: str, vault_path: Optional[Path] = None) -> Optional[Path]:
         target = (WORKSPACE / path).resolve()
 
     if str(target).startswith(str(WORKSPACE.resolve())):
+        return target
+    if str(target).startswith(str(CONTEXT_DIR.resolve())):
         return target
     if vault_path and str(target).startswith(str(vault_path.resolve())):
         return target
@@ -856,11 +940,50 @@ TOOL_SCHEMA_DESC = textwrap.dedent("""
     - If no tool is needed, answer directly without a <TOOL_CALL> block.
     - Do not use read_file to check your memory — it is already loaded at startup.
     - To persist information across sessions, end your FINAL response with an
-      <UPDATE_STATE>...</UPDATE_STATE> block containing the full updated state.md.
+      <UPDATE_STATE>...</UPDATE_STATE> block (updates context/objectives.md) or
+      <UPDATE_STATE file="user.md">...</UPDATE_STATE> to target a specific context file.
       Memory uses the tag. Files use write_file. These are separate mechanisms.
     - run_command executes whitelisted shell commands only. Never attempt
       commands outside the whitelist.
+
+    Output limits:
+    - Between tool calls: ≤20 words. You are mid-task. Acknowledge only.
+    - Final responses: ≤80 words unless the task is explicitly a document or long-form output.
+    - If you need to think, use <think> tags. Do not output reasoning in your response.
 """).strip()
+
+# ---------------------------------------------------------------------------
+# Tool hook middleware
+# ---------------------------------------------------------------------------
+
+_tool_log: list[dict] = []
+
+
+def before_tool(tc: ToolCall, mode: str) -> Optional[str]:
+    """Return an error string to block execution, or None to proceed."""
+    if mode == "plan" and tc.tool == "write_file":
+        return "ERROR: write_file is not permitted in plan mode. Produce a markdown plan instead."
+    if mode == "plan" and tc.tool == "run_command":
+        return "ERROR: run_command is not permitted in plan mode."
+    _tool_log.append({"ts": time.time(), "tool": tc.tool, "args": tc.dict()})
+    return None
+
+
+def after_tool(tc: ToolCall, result: str) -> str:
+    """Inspect/transform result before it goes back to the model."""
+    if len(result) > 8000:
+        result = result[:8000] + "\n[TRUNCATED — result exceeded 8000 chars]"
+    return result
+
+
+# Tool registry: name → callable
+TOOL_REGISTRY: dict[str, callable] = {
+    "read_file":   lambda tc, **kw: tool_read_file(tc.path or "", kw.get("vault_path")),
+    "write_file":  lambda tc, **kw: tool_write_file(tc.path or "", tc.content or "", kw.get("approve_all", False), kw.get("vault_path")),
+    "list_files":  lambda tc, **kw: tool_list_files(tc.path or ".", kw.get("vault_path")),
+    "fetch_url":   lambda tc, **kw: tool_fetch_url(tc.url or "", tc.query),
+    "run_command": lambda tc, **kw: tool_run_command(tc.cmd or ""),
+}
 
 # ---------------------------------------------------------------------------
 # Qwen3 thinking token handling
@@ -1007,7 +1130,8 @@ def run_react_loop(
             f"{TOOL_SCHEMA_DESC}\n\n"
             "Response style:\n"
             "- Plain conversational prose. No bullets or headers unless explicitly requested.\n"
-            "- 2-3 sentences unless the task requires more.\n"
+            "- Between tool calls: ≤20 words. You are mid-task. Acknowledge only.\n"
+            "- Final responses: ≤80 words unless the task is explicitly long-form output.\n"
             "- Synthesize retrieved context — never quote or dump it verbatim.\n"
             "- Never reference the state file, memory system, or context in your reply.\n"
             "- When saving to memory, confirm in one sentence only.\n\n"
@@ -1105,20 +1229,18 @@ def run_react_loop(
             dot = StatusDot(label, is_child=is_child)
             dot.start()
 
-        if tc.tool == "write_file" and plan_mode:
-            result = "ERROR: write_file is not permitted in plan mode. Produce a markdown plan instead."
-        elif tc.tool == "write_file":
-            result, approve_all = tool_write_file(tc.path or "", tc.content or "", approve_all, vault_path)
-        elif tc.tool == "read_file":
-            result = tool_read_file(tc.path or "", vault_path)
-        elif tc.tool == "list_files":
-            result = tool_list_files(tc.path or ".", vault_path)
-        elif tc.tool == "fetch_url":
-            result = tool_fetch_url(tc.url or "", tc.query)
-        elif tc.tool == "run_command":
-            result = tool_run_command(tc.cmd or "")
+        block = before_tool(tc, mode)
+        if block:
+            result = block
         else:
-            result = f"ERROR: Unknown tool '{tc.tool}'"
+            fn = TOOL_REGISTRY.get(tc.tool)
+            if fn is None:
+                result = f"ERROR: Unknown tool '{tc.tool}'"
+            elif tc.tool == "write_file":
+                result, approve_all = fn(tc, approve_all=approve_all, vault_path=vault_path)
+            else:
+                result = fn(tc, vault_path=vault_path)
+            result = after_tool(tc, result)
 
         if visible:
             dot.done()
@@ -1167,7 +1289,9 @@ def run_react_loop(
         "tokens":      total_tokens,
         "elapsed":     elapsed,
         "interrupted": was_interrupted,
+        "tool_log":    list(_tool_log),
     }
+    _tool_log.clear()
     return final_response, working_messages, approve_all, turn_stats
 
 # ---------------------------------------------------------------------------
@@ -1175,8 +1299,11 @@ def run_react_loop(
 # ---------------------------------------------------------------------------
 
 def is_first_run() -> bool:
-    state = read_state()
-    return "No historical context yet" in state and "User:" not in state
+    user_file = CONTEXT_DIR / "user.md"
+    if not user_file.exists():
+        return True
+    content = user_file.read_text()
+    return "No historical context yet" in content and "User:" not in content
 
 
 def clean_path_input(raw: str) -> str:
@@ -1185,19 +1312,22 @@ def clean_path_input(raw: str) -> str:
 
 
 def write_onboarding_state(name: str, vault: str, notes: str):
-    lines = ["# Conductor Memory & State\n",
-             "## Current Objectives\n",
-             "- Await user instructions.\n\n",
-             "## Context & Notes\n"]
+    # Write user context file
+    user_lines = ["# User Context\n"]
     if name:
-        lines.append(f"- User: {name}\n")
+        user_lines.append(f"- User: {name}\n")
     if vault:
-        lines.append(f"- Obsidian vault location: {vault}\n")
+        user_lines.append(f"- Obsidian vault location: {vault}\n")
     if notes:
-        lines.append(f"- {notes}\n")
+        user_lines.append(f"- {notes}\n")
     if not any([name, vault, notes]):
-        lines.append("- Initialized cleanly.\n")
-    write_state("".join(lines))
+        user_lines.append("- Initialized cleanly.\n")
+    (CONTEXT_DIR / "user.md").write_text("".join(user_lines))
+
+    # Write objectives file
+    (CONTEXT_DIR / "objectives.md").write_text(
+        "# Current Objectives\n- Await user instructions.\n"
+    )
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -1247,6 +1377,12 @@ def main():
             ).strip()
 
             if user_input.lower() in ("/exit", "/quit"):
+                if session_turns > 2:
+                    with Throbber("Consolidating memory"):
+                        consolidated = run_consolidation((CONTEXT_DIR / "objectives.md").read_text())
+                    if consolidated.strip():
+                        write_state(consolidated)
+                        console.print("[dim]  (memory consolidated)[/dim]")
                 elapsed = time.time() - session_start
                 console.print()
                 console.print(Panel(
@@ -1262,7 +1398,7 @@ def main():
                 break
 
             elif user_input.lower() == "/state":
-                console.print(Panel(Markdown(read_state()), title="state.md", border_style="dim"))
+                console.print(Panel(Markdown(read_state()), title="memory", border_style="dim"))
                 continue
 
             elif user_input.lower() == "/clear":
@@ -1343,6 +1479,8 @@ def main():
                         r"<UPDATE_STATE>.*?</UPDATE_STATE>", "", clean_final, flags=re.DOTALL
                     ).strip()
                     outer_messages.append({"role": "assistant", "content": clean_stored})
+                    _append_transcript("user", approval_message, tool_calls=0)
+                    _append_transcript("assistant", clean_stored, tool_calls=turn_stats["tool_calls"])
                     new_state = extract_state_update(final_response)
                     if new_state:
                         write_state(new_state)
@@ -1397,6 +1535,8 @@ def main():
                     r"<UPDATE_STATE>.*?</UPDATE_STATE>", "", clean_final, flags=re.DOTALL
                 )).strip()
                 outer_messages.append({"role": "assistant", "content": clean_stored})
+                _append_transcript("user", user_input, tool_calls=0)
+                _append_transcript("assistant", clean_stored, tool_calls=turn_stats["tool_calls"])
 
                 new_state = extract_state_update(final_response)
                 if new_state:
