@@ -1,4 +1,6 @@
-# Conductor | A Local Agentic Harness for Qwen3
+# Conductor
+
+### A Local Agentic Harness for Qwen3
 
 ![Conductor Screenshot](assets/screencap.png)
 
@@ -7,86 +9,215 @@
 [![Ollama](https://img.shields.io/badge/Ollama-Supported-orange.svg)](https://ollama.com/)
 [![Model: Qwen3.5:9b](https://img.shields.io/badge/Model-Qwen3.5:9b-green.svg)](https://qwenlm.github.io/)
 
-Conductor is a lightweight, command-line harness designed for **local LLM inference**. It transforms local models (specifically optimized for Qwen3 via Ollama) into capable, autonomous agents utilizing a ReAct (Reason and Act) loop. This was built primarily as an experiment to test the upper bound of running local inference with a harness on a decent-ish laptop.
+Conductor is a lightweight, command-line harness that transforms local models (optimized for Qwen3 via Ollama) into capable, autonomous agents using a ReAct loop. Built as an experiment to test the upper bound of local inference on consumer hardware.
 
-**Hardware Context:** This harness was explicitly built, constrained, and tested on a **2021 MacBook Pro (M1 chip, 16GB RAM)**. It demonstrates that sophisticated, agentic workflows—including web scraping, RAG, and file manipulation—can run securely and efficiently entirely on consumer hardware, without relying on cloud APIs.
+> **Hardware context:** Built, constrained, and tested on a **2021 MacBook Pro (M1, 16GB RAM)**. Agentic workflows including web search, RAG, file manipulation, and voice input run entirely on-device with no cloud APIs.
 
-## Key Features
+---
 
-* **ReAct Architecture:** Alternates between thought, tool execution, and observation to iteratively solve problems (capped at 8 steps per turn to prevent infinite loops).
-* **Strict Sandboxing:** All file operations are strictly confined to a local `./workspace` directory to prevent unauthorized system modifications.
-* **Built-in Tools:**
-  * **File System:** `read_file`, `write_file`, and `list_files`.
-  * **Web Fetching:** `fetch_url` extracts relevant text from web pages, utilizing local RAG (Retrieval-Augmented Generation) chunking.
-  * **PDF Extraction:** Built-in support for reading PDFs (requires `pdfplumber` or `pypdf`).
-  * **Shell Commands:** `run_command` executes a curated allowlist of shell commands (`obsidian`, `git`, `ls`, `pwd`, `echo`, `ps`, `df`, `date`, `python3`) from the workspace directory. Commands outside the allowlist are blocked outright; `python3 -c` is also blocked to prevent arbitrary code execution.
-* **Multi-Mode Operation:**
-  * **Default Mode:** Conversational interaction where Conductor can immediately act and use tools.
-  * **Plan Mode (`/plan`):** A read-only phase that follows a four-step process — **Explore** (read workspace), **Analyze** (identify changes and risks), **Plan** (write structured Markdown plan to `workspace/plan.md`), **Signal** (emit `<PLAN_READY/>` when complete). No writes are permitted during this phase.
-  * **Execute Mode (`/approve`):** Reviews and executes the previously generated plan step-by-step.
-* **Environment Awareness:** On each startup, Conductor writes `context/environment.md` with the current date, time, and timezone. If a city is configured, it fetches live weather from [Open-Meteo](https://open-meteo.com/) (free, no API key). Degrades gracefully offline — date/time always present, weather omitted silently on failure.
-* **Persistent Memory:** Context is managed through a modular `context/` directory — `user.md` (identity and preferences), `objectives.md` (session goals), and `environment.md` (date/time/weather). The `state.md` file serves as a thin index pointing to these context files. All context files are loaded into the system prompt each turn via `read_state()`.
-* **Obsidian Vault Integration:** If an Obsidian vault path is stored in `state.md`, file operations and `run_command obsidian` calls are also permitted against vault files, in addition to the standard `./workspace` sandbox.
-* **First-Run Onboarding:** On the first launch, Conductor prompts for your name, Obsidian vault path, city (for weather), and any additional context. All fields are optional.
-* **ESC Interrupt:** Press `ESC` at any time while the agent is running to cancel the current turn mid-stream. The turn is discarded and the prompt returns immediately.
-* **Voice Input (Push-to-Talk):** Hold right ⌥ (Option) to record, release to transcribe and send. Text is injected directly at the prompt. Falls back to `/mic` for manual record-then-Enter input. Requires `pynput`, `sounddevice`, and `mlx-whisper`; PTT needs a one-time macOS Accessibility permission grant.
-* **Session Transcript:** Every turn is appended to `conductor_transcript.jsonl` as an append-only audit log (timestamp, role, content, tool call count). Never read back by the harness — purely for external analysis.
-* **Session Consolidation:** On exit (after 2+ turns), Conductor runs a final LLM pass to clean up `objectives.md` — deduplicating facts, removing stale tasks, and resolving contradictions so the next session starts with a clean slate.
-* **Write Approval with Diff Preview:** Before any file is written, Conductor shows a line-level diff (green highlights for additions, red for removals) and prompts `y / a (approve all) / n`. No file is touched without explicit confirmation.
-* **Visual Progress Indicators:** A live "Thinking... (Xs)" throbber shows elapsed time during model inference. Tool calls display as a grey dot on start, replaced by green on completion. Chained calls are shown hierarchically (indented with `└`) and collapsed after 3 with a "+N more tool uses" summary.
-* **Qwen3 Optimized:** Intelligently handles Qwen3's thinking tokens, stripping them from the assistant history to save context space, while utilizing `/no_think` prompts for tool-execution turns.
+## Architecture
 
-## Prerequisites
+```
+┌─────────────────────────────────────────────────────────┐
+│                      User Input                         │
+└──────────────────────┬──────────────────────────────────┘
+                       │
+                       ▼
+              ┌────────────────┐
+              │  Fast-Path     │── match ──▶ Direct tool execution
+              │  Router        │            (0 LLM calls, <1s)
+              └───────┬────────┘
+                      │ no match
+                      ▼
+              ┌────────────────┐
+              │  Slash Command │── /plan, /approve, /compact, etc.
+              │  Dispatch      │   (deterministic, no LLM)
+              └───────┬────────┘
+                      │ not a command
+                      ▼
+         ┌────────────────────────┐
+         │     ReAct Loop         │
+         │  ┌──────────────────┐  │
+         │  │ System Prompt    │  │◀─── Full prompt (step 1)
+         │  │ + State + Tools  │  │◀─── Compressed prompt (step 2+)
+         │  └───────┬──────────┘  │
+         │          ▼             │
+         │  ┌──────────────────┐  │
+         │  │ LLM Inference    │  │──── thinking_budget: 512 (step 1)
+         │  │ (Ollama/Qwen3)   │  │──── thinking_budget: 128 (step 2+)
+         │  └───────┬──────────┘  │
+         │          ▼             │
+         │  ┌──────────────────┐  │
+         │  │ Tool Extraction  │  │──── JSON or XML fallback
+         │  │ + Execution      │  │
+         │  └───────┬──────────┘  │
+         │          │             │
+         │          ▼             │
+         │    Observation ────────│──▶ Loop (max 8 steps)
+         └────────────────────────┘
+                      │
+                      ▼
+         ┌────────────────────────┐
+         │  State Update          │──── <UPDATE_STATE> extraction
+         │  + Transcript Append   │──── conductor_transcript.jsonl
+         └────────────────────────┘
+```
 
-* Python 3.8+
-* [Ollama](https://ollama.com/) running locally.
-* The Qwen3 model installed in Ollama. The default configuration uses `qwen3.5:9b`:
+---
+
+## Features
+
+### Core
+
+| Feature | Description |
+|---|---|
+| **ReAct loop** | Alternating thought → tool → observation, capped at 8 steps per turn |
+| **Workspace sandboxing** | All file ops confined to `./workspace` (+ optional Obsidian vault) |
+| **Progressive context loading** | Full system prompt on step 1; compressed ~40-token prompt on continuations |
+| **Fast-path routing** | Pattern-matches obvious intents (`navigate to`, `open`, `read`, `create`, `list`) and routes directly to tools with zero LLM calls |
+| **Multi-instruction detection** | Compound requests ("do X. then do Y") bypass fast-path and go to the LLM |
+| **Bias to action** | System prompt instructs the model to act on reversible operations, not ask |
+
+### Tools
+
+| Tool | Description |
+|---|---|
+| `read_file` | Read files from workspace or vault. Supports PDF extraction via `pdfplumber`/`pypdf` |
+| `write_file` | Write files with diff preview and approval prompt (`y` / `a` approve all / `n`) |
+| `list_files` | List directory contents |
+| `fetch_url` | Fetch and extract text from a URL, with optional RAG-based chunk retrieval |
+| `web_search` | Search the web via DuckDuckGo. Returns top results with titles and snippets. No API key required |
+| `run_command` | Execute allowlisted shell commands: `obsidian`, `git`, `ls`, `pwd`, `echo`, `ps`, `df`, `date`, `python3`. Blocks `python3 -c` |
+| `done` | Signal task completion |
+
+### Modes
+
+```
+   /plan                        /approve
+────────▶  Plan Mode  ─────────────────▶  Execute Mode
+          (read-only)                     (step-by-step)
+              │                                │
+              │  Four phases:                   │  Runs the plan from
+              │  1. Explore                     │  workspace/plan.md
+              │  2. Analyze                     │  using all tools
+              │  3. Plan                        │
+              │  4. Signal (<PLAN_READY/>)       │
+              │                                │
+   /plan  ◀───┘                    ◀───────────┘
+          (back to default)        (auto-returns to default)
+```
+
+- **Default** — Conversational. Full tool access. Immediate action.
+- **Plan** (`/plan`) — Read-only exploration. Produces a structured Markdown plan saved to `workspace/plan.md`. No writes permitted.
+- **Execute** (`/approve`) — Executes the saved plan step-by-step with full tool access.
+
+### Memory & State
+
+```
+state.md                    (thin index → context files)
+  │
+  ├── context/user.md       (name, vault path, city, preferences)
+  ├── context/objectives.md (session goals, updated via <UPDATE_STATE>)
+  └── context/environment.md (date, time, timezone, weather — refreshed on boot)
+```
+
+- All context files loaded into the system prompt each turn via `read_state()`
+- Targeted updates: `<UPDATE_STATE file="user.md">` writes to a specific context file
+- **Session consolidation** on exit (after 2+ turns): LLM pass deduplicates, prunes stale objectives, resolves contradictions
+
+### Voice Input
+
+| Method | How |
+|---|---|
+| **Push-to-talk** | Hold right `⌥` (Option) to record, release to transcribe and send |
+| **Manual** (`/mic`) | Starts recording immediately; press Enter to stop and transcribe |
+
+Transcription uses `mlx-whisper` (on-device, Apple Silicon optimized). PTT requires macOS Accessibility permission for your terminal app. If STT dependencies aren't installed, the PTT listener doesn't start — no spurious error messages on accidental keypresses.
+
+### UX
+
+- **ESC interrupt** — Cancel a running turn mid-stream. Turn is discarded, prompt returns immediately.
+- **Thinking throbber** — Live `* Thinking... (Xs)` elapsed timer on stderr during inference.
+- **Tool status dots** — Grey dot on start → green on completion. Chained calls indented with `└`. Collapsed after 3 with `+N more tool uses`.
+- **Write diffs** — Line-level diff with green/red highlights before every file write.
+- **Session summary** — On `/exit`: turns, tool calls, total tokens, elapsed time.
+- **Context compaction** (`/compact`) — Compresses conversation history into a dense summary. Accepts optional focus: `/compact keep the file paths`.
+
+---
+
+## Qwen3 Optimizations
+
+- `<think>` tokens stripped from assistant history to save context space
+- `/no_think` appended on tool-execution turns to suppress unnecessary reasoning
+- Thinking budget capped at 512 tokens (step 1) and 128 tokens (continuation steps)
+- Continuation turns use a compressed system prompt (~40 tokens) instead of the full schema (~600 tokens)
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+- Python 3.8+
+- [Ollama](https://ollama.com/) running locally
+- Qwen3 model pulled:
   ```bash
-  ollama run qwen3.5:9b
+  ollama pull qwen3.5:9b
   ```
 
-## Installation
+### Install
 
-1. Clone this repository or place `conductor.py` in your desired directory.
-2. Install the core Python dependencies:
-   ```bash
-   pip install httpx beautifulsoup4 pydantic rich ollama
-   ```
-3. *(Optional)* Install extended dependencies for PDF parsing and advanced embedding retrieval:
-   ```bash
-   pip install pdfplumber pypdf sentence-transformers
-   ```
-4. *(Optional)* Install voice input dependencies (push-to-talk + `/mic`):
-   ```bash
-   pip install mlx-whisper sounddevice pynput
-   ```
-   > **macOS:** PTT requires granting Accessibility permission to your terminal app — System Settings → Privacy & Security → Accessibility.
+```bash
+# Core
+pip install httpx beautifulsoup4 pydantic rich ollama
 
-## Usage
+# Optional: PDF parsing + semantic retrieval
+pip install pdfplumber pypdf sentence-transformers
 
-Start the interactive terminal application:
+# Optional: voice input (push-to-talk + /mic)
+pip install mlx-whisper sounddevice pynput
+```
+
+> **macOS PTT:** Grant Accessibility permission to your terminal — System Settings → Privacy & Security → Accessibility.
+
+### Run
 
 ```bash
 python conductor.py
 ```
 
-### Interactive Commands
+First launch walks through onboarding: name, Obsidian vault path, city (for weather). All fields optional.
 
-Inside the Conductor interface, you can use the following commands to manage the agent:
+---
 
-* `/plan` — Toggle **Plan Mode** (read-only). Use this to let Conductor map out a solution safely.
-* `/approve` — Execute the plan currently saved in `workspace/plan.md`.
-* `/state` — View the current persistent memory state.
-* `/compact [focus]` — Compress the conversation history into a dense summary, freeing the context window. Optionally provide a focus (e.g., `/compact keep the file paths`) to direct what gets emphasized in the summary.
-* `/mic` — Fallback voice input: starts recording immediately, press Enter to stop and transcribe.
-* `/clear` — Clear the active conversation history (does not delete the persistent `state.md`).
-* `/help` — Display the list of commands.
-* `/exit` or `/quit` — Run session consolidation (if 2+ turns), then exit and display a summary panel with elapsed time, total turns, tool calls, and tokens consumed.
+## Commands
 
-## Research & Security Basis
+| Command | Description |
+|---|---|
+| `/plan` | Toggle plan mode (read-only) |
+| `/approve` | Execute `workspace/plan.md` |
+| `/state` | View current memory |
+| `/compact [focus]` | Compress conversation history |
+| `/mic` | Manual voice input (record → Enter → transcribe) |
+| `/clear` | Clear conversation history |
+| `/help` | Show commands |
+| `/exit`, `/quit` | Consolidate memory + exit with session summary |
 
-Conductor incorporates several modern LLM development patterns:
+---
 
-* **ReAct Pattern:** Based on Yao et al. (2022) for alternating thought/action.
-* **Prompt Injection Defense:** Follows OWASP LLM Top 10 guidelines by explicitly wrapping web data as untrusted content.
-* **Local RAG Chunking:** Optimized 400-word chunks with 50-word overlaps using `multi-qa-mpnet-base-dot-v1` embeddings (preferred over MiniLM for retrieval tasks).
+## Security
+
+- **Workspace sandbox** — file operations blocked outside `./workspace` and configured vault
+- **Allowlisted commands** — `run_command` only permits a fixed set; `python3 -c` explicitly blocked
+- **Untrusted content delimiters** — `fetch_url` and `web_search` results wrapped with injection-mitigation markers per OWASP LLM Top 10
+- **Path traversal guard** — all paths resolved and checked against allowed roots before any I/O
+- **Empty path guard** — `read_file` and `write_file` reject empty/null paths before resolution
+
+## Research Basis
+
+- **ReAct pattern** — Yao et al. 2022
+- **Prompt injection defense** — OWASP LLM Top 10 2025, arxiv 2601.04795
+- **RAG chunking** — 400-word chunks, 50-word overlap; `multi-qa-mpnet-base-dot-v1` embeddings
+- **Fast-path routing** — inspired by Claude Code's deterministic dispatch for slash commands and obvious intents
+- **Progressive context loading** — compressed continuation prompts, inspired by production agent harness patterns
+- **Step budget cap** — IBM/LangChain consensus: 5-10 max iterations
